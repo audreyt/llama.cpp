@@ -1,14 +1,20 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-cp -rpv ../ggml/src/ggml.c           ./ggml.c
-cp -rpv ../ggml/src/ggml-cuda.h      ./ggml-cuda.h
-cp -rpv ../ggml/src/ggml-cuda.cu     ./ggml-cuda.cu
-cp -rpv ../ggml/src/ggml-opencl.h    ./ggml-opencl.h
-cp -rpv ../ggml/src/ggml-opencl.cpp  ./ggml-opencl.cpp
-cp -rpv ../ggml/src/ggml-metal.h     ./ggml-metal.h
-cp -rpv ../ggml/src/ggml-metal.m     ./ggml-metal.m
-cp -rpv ../ggml/src/ggml-metal.metal ./ggml-metal.metal
-cp -rpv ../ggml/include/ggml/ggml.h  ./ggml.h
+cp -rpv ../ggml/CMakeLists.txt       ./ggml/CMakeLists.txt
+cp -rpv ../ggml/src/CMakeLists.txt   ./ggml/src/CMakeLists.txt
 
-cp -rpv ../ggml/tests/test-opt.c    ./tests/test-opt.c
-cp -rpv ../ggml/tests/test-grad0.c  ./tests/test-grad0.c
+cp -rpv ../ggml/cmake/* ./ggml/cmake/
+cp -rpv ../ggml/src/ggml-cpu/cmake/* ./ggml/src/ggml-cpu/cmake/
+
+cp -rpv ../ggml/src/ggml* ./ggml/src/
+
+cp -rpv ../ggml/include/ggml*.h ./ggml/include/
+cp -rpv ../ggml/include/gguf*.h ./ggml/include/
+
+cp -rpv ../ggml/tests/test-opt.cpp           ./tests/test-opt.cpp
+cp -rpv ../ggml/tests/test-quantize-fns.cpp  ./tests/test-quantize-fns.cpp
+cp -rpv ../ggml/tests/test-quantize-perf.cpp ./tests/test-quantize-perf.cpp
+cp -rpv ../ggml/tests/test-backend-ops.cpp   ./tests/test-backend-ops.cpp
+
+cp -rpv ../LICENSE                     ./LICENSE
+cp -rpv ../ggml/scripts/gen-authors.sh ./scripts/gen-authors.sh

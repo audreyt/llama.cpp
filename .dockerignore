@@ -1,23 +1,19 @@
 *.o
 *.a
 .cache/
+# Do not ignore .git directory, otherwise the reported build number will always be 0
+.github/
+.gitignore
 .vs/
 .vscode/
 .DS_Store
 
-build/
-build-em/
-build-debug/
-build-release/
-build-static/
-build-no-accel/
-build-sanitize-addr/
-build-sanitize-thread/
+build*/
 
 models/*
 
-/main
-/quantize
+/llama-cli
+/llama-quantize
 
 arm_neon.h
 compile_commands.json

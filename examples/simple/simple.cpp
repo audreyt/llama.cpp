@@ -1,181 +1,220 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-
-#include "common.h"
 #include "llama.h"
-#include "build-info.h"
-
-#include <cassert>
-#include <cinttypes>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
-#include <fstream>
-#include <iostream>
 #include <string>
 #include <vector>
 
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
-#include <signal.h>
-#include <unistd.h>
-#elif defined (_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <signal.h>
-#endif
+static void print_usage(int, char ** argv) {
+    printf("\nexample usage:\n");
+    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [prompt]\n", argv[0]);
+    printf("\n");
+}
 
+int main(int argc, char ** argv) {
+    // path to the model gguf file
+    std::string model_path;
+    // prompt to generate text from
+    std::string prompt = "Hello my name is";
+    // number of layers to offload to the GPU
+    int ngl = 99;
+    // number of tokens to predict
+    int n_predict = 32;
 
+    // parse command line arguments
 
-int main(int argc, char ** argv)
-{
-    gpt_params params;
-
-    //---------------------------------
-    // Print help :
-    //---------------------------------
-
-    if ( argc == 1 || argv[1][0] == '-' )
     {
-        printf( "usage: %s MODEL_PATH [PROMPT]\n" , argv[0] );
-        return 1 ;
+        int i = 1;
+        for (; i < argc; i++) {
+            if (strcmp(argv[i], "-m") == 0) {
+                if (i + 1 < argc) {
+                    model_path = argv[++i];
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-n") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        n_predict = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-ngl") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        ngl = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else {
+                // prompt starts here
+                break;
+            }
+        }
+        if (model_path.empty()) {
+            print_usage(argc, argv);
+            return 1;
+        }
+        if (i < argc) {
+            prompt = argv[i++];
+            for (; i < argc; i++) {
+                prompt += " ";
+                prompt += argv[i];
+            }
+        }
     }
 
-    //---------------------------------
-    // Load parameters :
-    //---------------------------------
+    // load dynamic backends
 
-    if ( argc >= 2 )
-    {
-        params.model = argv[1];
-    }
+    ggml_backend_load_all();
 
-    if ( argc >= 3 )
-    {
-        params.prompt = argv[2];
-    }
+    // initialize the model
 
-    if ( params.prompt.empty() )
-    {
-        params.prompt = "Hello my name is";
-    }
+    llama_model_params model_params = llama_model_default_params();
+    model_params.n_gpu_layers = ngl;
 
-    //---------------------------------
-    // Init LLM :
-    //---------------------------------
+    llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
 
-    llama_backend_init(params.numa);
-
-    llama_model * model;
-    llama_context * ctx;
-
-    std::tie(model, ctx) = llama_init_from_gpt_params( params );
-
-    if ( model == NULL )
-    {
-        fprintf( stderr , "%s: error: unable to load model\n" , __func__ );
+    if (model == NULL) {
+        fprintf(stderr , "%s: error: unable to load model\n" , __func__);
         return 1;
     }
 
-    //---------------------------------
-    // Tokenize the prompt :
-    //---------------------------------
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    // tokenize the prompt
 
-    std::vector<llama_token> tokens_list;
-    tokens_list = ::llama_tokenize( ctx , params.prompt , true );
+    // find the number of tokens in the prompt
+    const int n_prompt = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
 
-    const int max_context_size     = llama_n_ctx( ctx );
-    const int max_tokens_list_size = max_context_size - 4 ;
-
-    if ( (int)tokens_list.size() > max_tokens_list_size )
-    {
-        fprintf( stderr , "%s: error: prompt too long (%d tokens, max %d)\n" ,
-             __func__ , (int)tokens_list.size() , max_tokens_list_size );
+    // allocate space for the tokens and tokenize the prompt
+    std::vector<llama_token> prompt_tokens(n_prompt);
+    if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) < 0) {
+        fprintf(stderr, "%s: error: failed to tokenize the prompt\n", __func__);
         return 1;
     }
 
-    fprintf( stderr, "\n\n" );
+    // initialize the context
 
-    // Print the tokens from the prompt :
+    llama_context_params ctx_params = llama_context_default_params();
+    // n_ctx is the context size
+    ctx_params.n_ctx = n_prompt + n_predict - 1;
+    // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
+    ctx_params.n_batch = n_prompt;
+    // enable performance counters
+    ctx_params.no_perf = false;
 
-    for( auto id : tokens_list )
-    {
-        printf( "%s" , llama_token_to_str( ctx , id ) );
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
+
+    if (ctx == NULL) {
+        fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
+        return 1;
     }
 
-    fflush(stdout);
+    // initialize the sampler
 
+    auto sparams = llama_sampler_chain_default_params();
+    sparams.no_perf = false;
+    llama_sampler * smpl = llama_sampler_chain_init(sparams);
 
-    //---------------------------------
-    // Main prediction loop :
-    //---------------------------------
+    llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
-    // The LLM keeps a contextual cache memory of previous token evaluation.
-    // Usually, once this cache is full, it is required to recompute a compressed context based on previous
-    // tokens (see "infinite text generation via context swapping" in the main example), but in this minimalist
-    // example, we will just stop the loop once this cache is full or once an end of stream is detected.
+    // print the prompt token-by-token
 
-    while ( llama_get_kv_cache_token_count( ctx ) < max_context_size )
-    {
-        //---------------------------------
-        // Evaluate the tokens :
-        //---------------------------------
+    for (auto id : prompt_tokens) {
+        char buf[128];
+        int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
+        if (n < 0) {
+            fprintf(stderr, "%s: error: failed to convert token to piece\n", __func__);
+            return 1;
+        }
+        std::string s(buf, n);
+        printf("%s", s.c_str());
+    }
 
-        if ( llama_eval( ctx , tokens_list.data() , tokens_list.size() , llama_get_kv_cache_token_count( ctx ) , params.n_threads ) )
-        {
-            fprintf( stderr,  "%s : failed to eval\n" , __func__ );
+    // prepare a batch for the prompt
+
+    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
+
+    if (llama_model_has_encoder(model)) {
+        if (llama_encode(ctx, batch)) {
+            fprintf(stderr, "%s : failed to eval\n", __func__);
             return 1;
         }
 
-        tokens_list.clear();
-
-        //---------------------------------
-        // Select the best prediction :
-        //---------------------------------
-
-        llama_token new_token_id = 0;
-
-        auto logits  = llama_get_logits( ctx );
-        auto n_vocab = llama_n_vocab( ctx ); // the size of the LLM vocabulary (in tokens)
-
-        std::vector<llama_token_data> candidates;
-        candidates.reserve( n_vocab );
-
-        for( llama_token token_id = 0 ; token_id < n_vocab ; token_id++ )
-        {
-            candidates.emplace_back( llama_token_data{ token_id , logits[ token_id ] , 0.0f } );
+        llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
+        if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
+            decoder_start_token_id = llama_vocab_bos(vocab);
         }
 
-        llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
+        batch = llama_batch_get_one(&decoder_start_token_id, 1);
+    }
 
-        // Select it using the "Greedy sampling" method :
-        new_token_id = llama_sample_token_greedy( ctx , &candidates_p );
+    // main loop
 
+    const auto t_main_start = ggml_time_us();
+    int n_decode = 0;
+    llama_token new_token_id;
 
-        // is it an end of stream ?
-        if ( new_token_id == llama_token_eos() )
-        {
-            fprintf(stderr, " [end of text]\n");
-            break;
+    for (int n_pos = 0; n_pos + batch.n_tokens < n_prompt + n_predict; ) {
+        // evaluate the current batch with the transformer model
+        if (llama_decode(ctx, batch)) {
+            fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
+            return 1;
         }
 
-        // Print the new token :
-        printf( "%s" , llama_token_to_str( ctx , new_token_id ) );
-        fflush( stdout );
+        n_pos += batch.n_tokens;
 
-        // Push this new token for next evaluation :
-        tokens_list.push_back( new_token_id );
+        // sample the next token
+        {
+            new_token_id = llama_sampler_sample(smpl, ctx, -1);
 
-    } // wend of main loop
+            // is it an end of generation?
+            if (llama_vocab_is_eog(vocab, new_token_id)) {
+                break;
+            }
 
-    llama_free( ctx );
-    llama_free_model( model );
+            char buf[128];
+            int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
+            if (n < 0) {
+                fprintf(stderr, "%s: error: failed to convert token to piece\n", __func__);
+                return 1;
+            }
+            std::string s(buf, n);
+            printf("%s", s.c_str());
+            fflush(stdout);
 
-    llama_backend_free();
+            // prepare the next batch with the sampled token
+            batch = llama_batch_get_one(&new_token_id, 1);
+
+            n_decode += 1;
+        }
+    }
+
+    printf("\n");
+
+    const auto t_main_end = ggml_time_us();
+
+    fprintf(stderr, "%s: decoded %d tokens in %.2f s, speed: %.2f t/s\n",
+            __func__, n_decode, (t_main_end - t_main_start) / 1000000.0f, n_decode / ((t_main_end - t_main_start) / 1000000.0f));
+
+    fprintf(stderr, "\n");
+    llama_perf_sampler_print(smpl);
+    llama_perf_context_print(ctx);
+    fprintf(stderr, "\n");
+
+    llama_sampler_free(smpl);
+    llama_free(ctx);
+    llama_model_free(model);
 
     return 0;
 }
-
-// EOF
