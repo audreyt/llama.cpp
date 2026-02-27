@@ -153,9 +153,15 @@ uint32_t llama_hparams::n_embd_r() const {
 }
 
 uint32_t llama_hparams::n_embd_s() const {
+    if (pr_expanded_dim != 0) {
+        // Power Retention: state is [D, head_dim] + [D] normalizer per KV head
+        return n_head_kv() * pr_expanded_dim * (wkv_head_size + 1);
+    }
+
     if (wkv_head_size != 0) {
         // corresponds to RWKV's wkv_states size
-        return n_embd * wkv_head_size;
+        // use n_head_kv to handle GQA (e.g. QWEN2PR); for non-GQA models n_head_kv == n_head
+        return n_head_kv() * wkv_head_size * wkv_head_size;
     }
 
     if (n_embd_head_kda != 0) {

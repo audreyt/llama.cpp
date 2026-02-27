@@ -10596,6 +10596,190 @@ void ggml_compute_forward_rwkv_wkv7(
     }
 }
 
+// ggml_compute_forward_power_retention
+
+// Compute expanded phi dimension for power retention (degree=2, IB=16, OB=8)
+static int64_t power_retention_expanded_dim(int64_t head_dim) {
+    const int64_t IB = 16, OB = 8;
+    return ((IB/OB + head_dim/OB) * (head_dim/IB) / 2) * (IB * OB);
+}
+
+// Compute phi_key: blocked symmetric outer product with 2x for off-diagonal blocks
+// x: [head_dim], out: [D]
+// InnerBlock=16, OuterBlock=8
+static void compute_phi_key(const float * x, float * out, int64_t head_dim) {
+    const int64_t IB = 16, OB = 8;
+    const int64_t n_inner = head_dim / IB;
+    const int64_t n_outer = head_dim / OB;
+    int64_t idx = 0;
+
+    for (int64_t y_idx = 0; y_idx < n_inner; y_idx++) {
+        const int64_t x_limit = (y_idx + 1) * IB / OB; // = (y_idx+1)*2
+        const int64_t x_end = x_limit < n_outer ? x_limit : n_outer;
+
+        for (int64_t x_idx = 0; x_idx < x_end; x_idx++) {
+            // Off-diagonal: (x_idx+1)*OB <= y_idx*IB, i.e. block is strictly below diagonal
+            const float mult = ((x_idx + 1) * OB > y_idx * IB) ? 1.0f : 2.0f;
+            const float * x_outer = x + x_idx * OB;
+            const float * x_inner = x + y_idx * IB;
+
+            for (int64_t a = 0; a < OB; a++) {
+                const float xa = mult * x_outer[a];
+                for (int64_t b = 0; b < IB; b++) {
+                    out[idx++] = xa * x_inner[b];
+                }
+            }
+        }
+    }
+}
+
+// Compute phi_query: blocked symmetric outer product, no multiplier
+// x: [head_dim], out: [D]
+// InnerBlock=16, OuterBlock=1
+static void compute_phi_query(const float * x, float * out, int64_t head_dim) {
+    const int64_t IB = 16, OB = 1;
+    const int64_t n_inner = head_dim / IB;
+    const int64_t n_outer = head_dim / OB; // = head_dim
+
+    int64_t idx = 0;
+
+    for (int64_t y_idx = 0; y_idx < n_inner; y_idx++) {
+        const int64_t x_limit = (y_idx + 1) * IB / OB; // = (y_idx+1)*16
+        const int64_t x_end = x_limit < n_outer ? x_limit : n_outer;
+
+        for (int64_t x_idx = 0; x_idx < x_end; x_idx++) {
+            const float xa = x[x_idx]; // OB=1, so just one element
+            const float * x_inner = x + y_idx * IB;
+
+            for (int64_t b = 0; b < IB; b++) {
+                out[idx++] = xa * x_inner[b];
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_power_retention_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * k_t     = dst->src[0]; // [S, H_kv, T]
+    const ggml_tensor * v_t     = dst->src[1]; // [S, H_kv, T]
+    const ggml_tensor * q_t     = dst->src[2]; // [S, H,    T]
+    const ggml_tensor * g_t     = dst->src[3]; // [H_kv, T] (raw gate logits)
+    const ggml_tensor * state_t = dst->src[4]; // [D*(S+1)*H_kv, n_seqs]
+
+    const int64_t S      = k_t->ne[0];
+    const int64_t H_kv   = k_t->ne[1];
+    const int64_t T      = k_t->ne[2];
+    const int64_t H      = q_t->ne[1];
+    const int64_t n_seqs = state_t->ne[1];
+    const int64_t groups = H / H_kv;
+    const int64_t n_seq_tokens = T / n_seqs;
+    const int64_t D      = power_retention_expanded_dim(S);
+
+    const int ith  = params->ith;
+    const int nth  = params->nth;
+
+    const float * k     = (const float *)k_t->data;
+    const float * v     = (const float *)v_t->data;
+    const float * q     = (const float *)q_t->data;
+    const float * g     = (const float *)g_t->data;
+    const float * s_in  = (const float *)state_t->data;
+
+    float * dst_data  = (float *)dst->data;
+    float * out_attn  = dst_data;
+    float * out_state = dst_data + S * H * T;
+
+    const int64_t state_per_head = D * (S + 1); // [D, S] state matrix + [D] normalizer
+    const int64_t total_state = state_per_head * H_kv * n_seqs;
+
+    // Copy initial states to output state buffer
+    if (ith == 0) {
+        memcpy(out_state, s_in, total_state * sizeof(float));
+    }
+    ggml_barrier(params->threadpool);
+
+    // Thread-local phi buffers (heap allocated for large D)
+    std::vector<float> phi_k_buf(D);
+    std::vector<float> phi_q_buf(D);
+
+    for (int64_t seq = 0; seq < n_seqs; seq++) {
+        for (int64_t h_kv = ith; h_kv < H_kv; h_kv += nth) {
+            // State layout per head: [D * S] matrix followed by [D] normalizer
+            float * S_state = out_state + seq * state_per_head * H_kv + h_kv * state_per_head;
+            float * s_norm  = S_state + D * S; // normalizer: [D]
+
+            const int64_t t_start = seq * n_seq_tokens;
+            const int64_t t_end   = t_start + n_seq_tokens;
+
+            for (int64_t t = t_start; t < t_end; t++) {
+                // Decay = sigmoid(raw gate logit)
+                const float g_raw = g[t * H_kv + h_kv];
+                const float decay = 1.0f / (1.0f + expf(-g_raw));
+
+                const float * k_vec = k + t * H_kv * S + h_kv * S;
+                const float * v_vec = v + t * H_kv * S + h_kv * S;
+
+                // Compute phi(k)
+                compute_phi_key(k_vec, phi_k_buf.data(), S);
+
+                // State update: S[i,j] = decay * S[i,j] + phi_k[i] * v[j]
+                for (int64_t i = 0; i < D; i++) {
+                    const float pk = phi_k_buf[i];
+                    float * S_row = S_state + i * S;
+                    for (int64_t j = 0; j < S; j++) {
+                        S_row[j] = decay * S_row[j] + pk * v_vec[j];
+                    }
+                    // Normalizer update: s[i] = decay * s[i] + phi_k[i]
+                    s_norm[i] = decay * s_norm[i] + pk;
+                }
+
+                // Output for each Q head group
+                for (int64_t g_idx = 0; g_idx < groups; g_idx++) {
+                    const int64_t h_q = h_kv * groups + g_idx;
+                    const float * q_vec = q + t * H * S + h_q * S;
+                    float * out_vec = out_attn + t * H * S + h_q * S;
+
+                    compute_phi_query(q_vec, phi_q_buf.data(), S);
+
+                    // Denominator: phi_q . s_norm
+                    float denom = 0.0f;
+                    for (int64_t i = 0; i < D; i++) {
+                        denom += phi_q_buf[i] * s_norm[i];
+                    }
+                    // Avoid division by zero
+                    if (fabsf(denom) < 1e-12f) {
+                        denom = 1e-12f;
+                    }
+                    const float inv_denom = 1.0f / denom;
+
+                    // Numerator: phi_q @ S_state -> [S]
+                    for (int64_t j = 0; j < S; j++) {
+                        float num = 0.0f;
+                        for (int64_t i = 0; i < D; i++) {
+                            num += phi_q_buf[i] * S_state[i * S + j];
+                        }
+                        out_vec[j] = num * inv_denom;
+                    }
+
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_power_retention(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            ggml_compute_forward_power_retention_f32(params, dst);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 // ggml_compute_forward_map_custom1
 
 void ggml_compute_forward_map_custom1(

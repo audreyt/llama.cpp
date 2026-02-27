@@ -215,6 +215,7 @@ struct llama_layer {
     struct ggml_tensor * attn_k_norm     = nullptr;
     struct ggml_tensor * attn_k_norm_b   = nullptr;
     struct ggml_tensor * attn_out_norm   = nullptr;
+    struct ggml_tensor * wg              = nullptr; // power retention gate projection
     struct ggml_tensor * attn_out_norm_b = nullptr;
     struct ggml_tensor * attn_q_a_norm   = nullptr;
     struct ggml_tensor * attn_kv_a_norm  = nullptr;

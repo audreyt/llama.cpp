@@ -1030,6 +1030,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV6",
     "GATED_LINEAR_ATTN",
     "RWKV_WKV7",
+    "POWER_RETENTION",
     "SOLVE_TRI",
 
     "UNARY",
@@ -1048,7 +1049,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1139,6 +1140,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv6(k, v, r, tf, td, s)",
     "gated_linear_attn(k, v, q, gate, s)",
     "rwkv_wkv7(r, w, k, v, a, b, s)",
+    "power_ret(k, v, q, g, s)",
     "A X = B, A triangular, solve X",
 
     "unary(x)",
@@ -1157,7 +1159,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5763,6 +5765,56 @@ struct ggml_tensor * ggml_rwkv_wkv7(
     result->src[4] = a;
     result->src[5] = b;
     result->src[6] = state;
+
+    return result;
+}
+
+// ggml_power_retention
+
+// Compute expanded phi dimension for power retention (degree=2, IB=16, OB=8)
+static int64_t power_retention_expanded_dim(int64_t head_dim) {
+    const int64_t IB = 16, OB = 8;
+    return ((IB/OB + head_dim/OB) * (head_dim/IB) / 2) * (IB * OB);
+}
+
+struct ggml_tensor * ggml_power_retention(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * state) {
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(ggml_is_contiguous(v));
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    const int64_t S      = k->ne[0];   // head_dim
+    const int64_t H_kv   = k->ne[1];   // n_kv_heads
+    const int64_t T      = k->ne[2];   // n_tokens
+    const int64_t H      = q->ne[1];   // n_heads (>= H_kv)
+    const int64_t n_seqs = state->ne[1];
+    const int64_t D      = power_retention_expanded_dim(S);
+
+    GGML_ASSERT(S % 16 == 0); // must be divisible by InnerBlock
+    GGML_ASSERT(v->ne[0] == S && v->ne[1] == H_kv && v->ne[2] == T);
+    GGML_ASSERT(q->ne[0] == S && q->ne[2] == T);
+    GGML_ASSERT(g->ne[0] == H_kv && g->ne[1] == T);
+    GGML_ASSERT(ggml_nelements(state) == D * (S + 1) * H_kv * n_seqs);
+    GGML_ASSERT(H % H_kv == 0); // GQA groups must be integer
+
+    // Output layout: [S*H*T + D*(S+1)*H_kv*n_seqs] flat
+    const int64_t out_tokens = S * H * T;
+    const int64_t out_state  = D * (S + 1) * H_kv * n_seqs;
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_tokens + out_state);
+
+    result->op     = GGML_OP_POWER_RETENTION;
+    result->src[0] = k;
+    result->src[1] = v;
+    result->src[2] = q;
+    result->src[3] = g;
+    result->src[4] = state;
 
     return result;
 }

@@ -121,6 +121,7 @@ add_library(llama
             models/plm.cpp
             models/qwen.cpp
             models/qwen2.cpp
+            models/qwen2pr.cpp
             models/qwen2moe.cpp
             models/qwen2vl.cpp
             models/qwen3.cpp

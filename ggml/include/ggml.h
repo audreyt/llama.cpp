@@ -555,6 +555,7 @@ extern "C" {
         GGML_OP_RWKV_WKV6,
         GGML_OP_GATED_LINEAR_ATTN,
         GGML_OP_RWKV_WKV7,
+        GGML_OP_POWER_RETENTION,
         GGML_OP_SOLVE_TRI,
 
         GGML_OP_UNARY,
@@ -2440,6 +2441,19 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
+            struct ggml_tensor  * state);
+
+    // Power Retention attention (Brumby/linear recurrent attention with per-KV-head decay).
+    // k, v: [head_dim, n_kv_heads, T]  q: [head_dim, n_heads, T]
+    // g:    [n_kv_heads, T]  (pre-computed exp decay, one scalar per KV head per token)
+    // state: [head_dim*head_dim*n_kv_heads, n_seqs]
+    // Output: [head_dim*n_heads*T + head_dim*head_dim*n_kv_heads*n_seqs] (tokens | updated state)
+    GGML_API struct ggml_tensor * ggml_power_retention(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * g,
             struct ggml_tensor  * state);
 
     /* Solves a specific equation of the form Ax=B, where A is a triangular matrix

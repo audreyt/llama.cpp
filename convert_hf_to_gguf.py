@@ -3591,7 +3591,34 @@ class Qwen2Model(TextModel):
                 or name.startswith("model.vision_tower") or name.startswith("model.multi_modal_projector"):
             # skip vision and audio tensors
             return
+        if name.endswith(".self_attn.g_proj.weight"):
+            # skip unsupported custom gating tensor
+            return
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Qwen2PRForCausalLM")
+class Qwen2PRModel(Qwen2Model):
+    """Qwen2 with Power Retention linear recurrent attention (Brumby)."""
+    model_arch = gguf.MODEL_ARCH.QWEN2PR
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        # wkv_head_size = head_dim
+        n_head   = self.hparams.get("num_attention_heads", 40)
+        head_dim = self.hparams.get("hidden_size", 5120) // n_head
+        self.gguf_writer.add_wkv_head_size(head_dim)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith(".self_attn.g_proj.weight"):
+            # map g_proj to ATTN_G
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_G, bid, ".weight"), data_torch)
+            return
+        if name.startswith("mlp") or name.startswith("multi_modal_projector") \
+                or name.startswith("vision_model") or name.startswith("audio_tower") \
+                or name.startswith("model.vision_tower") or name.startswith("model.multi_modal_projector"):
+            return
+        yield from TextModel.modify_tensors(self, data_torch, name, bid)
 
 
 @ModelBase.register("DreamModel")

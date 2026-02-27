@@ -35,6 +35,7 @@ enum llm_arch {
     LLM_ARCH_STABLELM,
     LLM_ARCH_QWEN,
     LLM_ARCH_QWEN2,
+    LLM_ARCH_QWEN2PR, // Qwen2 with Power Retention (linear recurrent) attention
     LLM_ARCH_QWEN2MOE,
     LLM_ARCH_QWEN2VL,
     LLM_ARCH_QWEN3,
@@ -383,6 +384,7 @@ enum llm_tensor {
     LLM_TENSOR_FFN_EXP_PROBS_B,
     LLM_TENSOR_ATTN_Q_NORM,
     LLM_TENSOR_ATTN_K_NORM,
+    LLM_TENSOR_ATTN_G,         // power retention gate projection
     LLM_TENSOR_LAYER_OUT_NORM,
     LLM_TENSOR_POST_ATTN_NORM,
     LLM_TENSOR_POST_MLP_NORM,
