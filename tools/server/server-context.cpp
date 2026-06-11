@@ -7,7 +7,9 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "diffusion.h"
 #include "fit.h"
+#include "gguf.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -55,6 +57,41 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
 
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+}
+
+// peek at a single integer GGUF metadata key without loading the model
+// used to detect block-diffusion canvas models before the llama_context is created
+static int64_t gguf_peek_i64(const std::string & path, const char * key, int64_t def) {
+    gguf_init_params meta_params = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ nullptr,
+    };
+
+    gguf_context * meta = gguf_init_from_file(path.c_str(), meta_params);
+    if (!meta) {
+        return def;
+    }
+
+    int64_t res = def;
+
+    const int64_t i = gguf_find_key(meta, key);
+    if (i >= 0) {
+        switch (gguf_get_kv_type(meta, i)) {
+            case GGUF_TYPE_UINT8:  res = gguf_get_val_u8 (meta, i); break;
+            case GGUF_TYPE_INT8:   res = gguf_get_val_i8 (meta, i); break;
+            case GGUF_TYPE_UINT16: res = gguf_get_val_u16(meta, i); break;
+            case GGUF_TYPE_INT16:  res = gguf_get_val_i16(meta, i); break;
+            case GGUF_TYPE_UINT32: res = gguf_get_val_u32(meta, i); break;
+            case GGUF_TYPE_INT32:  res = gguf_get_val_i32(meta, i); break;
+            case GGUF_TYPE_UINT64: res = gguf_get_val_u64(meta, i); break;
+            case GGUF_TYPE_INT64:  res = gguf_get_val_i64(meta, i); break;
+            default: break;
+        }
+    }
+
+    gguf_free(meta);
+
+    return res;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -728,6 +765,12 @@ private:
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
 
+    // block-diffusion canvas models (e.g. DiffusionGemma): generation runs the entropy-bound denoiser
+    // in update_slots_diffusion() instead of the autoregressive decode path
+    bool                diffusion_mode   = false;
+    int32_t             diffusion_canvas = 0;  // GGUF diffusion.canvas_length
+    diffusion_eb_params diffusion_eb;          // sampler config resolved from GGUF diffusion.eb_* keys
+
     bool sleeping = false;
 
     void destroy() {
@@ -768,7 +811,59 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+
+        // block-diffusion canvas models need the slot/context policy decided before the context is
+        // created: peek at the GGUF metadata (cheap, no tensor data is read)
+        diffusion_canvas = (int32_t) gguf_peek_i64(params_base.model.path, "diffusion.canvas_length", 0);
+        diffusion_mode   = diffusion_canvas > 0;
+
+        if (diffusion_mode) {
+            SRV_INF("block-diffusion canvas model detected, canvas_length = %d\n", diffusion_canvas);
+
+            // a single slot: the denoise loop owns the whole context, and the per-request diffusion
+            // state (llama_diffusion_set_sc) lives on the model, so concurrent slots would race.
+            // concurrent requests are queued by the regular slot scheduling logic
+            if (params_base.n_parallel != 1) {
+                SRV_WRN("n_parallel = %d is not supported by block-diffusion models, forcing n_parallel = 1\n",
+                        params_base.n_parallel);
+                params_base.n_parallel = 1;
+            }
+
+            // the whole [prompt | canvas] must decode in ONE non-causal ubatch; size the batches from the
+            // context size, similar to how examples/diffusion/diffusion-cli.cpp sizes them from -n.
+            // an automatic -c would be resolved only later (by the fit pass, possibly to the full training
+            // context), so pin a predictable default here; note that the compute buffers scale with
+            // n_ubatch * n_vocab, so very large -c values are expensive
+            if (params_base.n_ctx <= 0) {
+                params_base.n_ctx = 8192;
+                SRV_INF("block-diffusion: -c is auto, defaulting to n_ctx = %d\n", params_base.n_ctx);
+            }
+            params_base.n_ubatch = std::max(params_base.n_ubatch, params_base.n_ctx);
+            params_base.n_batch  = std::max(params_base.n_batch,  params_base.n_ubatch);
+
+            // no llama KV cache exists for diffusion archs (create_memory returns nullptr) - disable
+            // everything that assumes one
+            params_base.ctx_shift              = false;
+            params_base.n_cache_reuse          = 0;
+            params_base.cache_ram_mib          = 0;     // prompt cache
+            params_base.cache_idle_slots       = false;
+            params_base.slot_prompt_similarity = 0.0f;
+
+            // the warmup decode is pointless without a KV cache
+            params_base.warmup = false;
+
+            if (!params_base.mmproj.path.empty()) {
+                SRV_ERR("%s", "multimodal is not supported by block-diffusion models\n");
+                return false;
+            }
+        }
+
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        if (diffusion_mode) {
+            // every denoise step needs logits for every canvas position (0 = n_batch)
+            params_base.n_outputs_max = 0;
+        }
 
         std::string & mmproj_path = params_base.mmproj.path;
         bool has_mmproj = !mmproj_path.empty();
@@ -905,6 +1000,40 @@ private:
         n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        if (diffusion_mode) {
+            if (!llama_model_is_diffusion(model_tgt)) {
+                SRV_ERR("%s", "model has diffusion.canvas_length but is not a diffusion architecture\n");
+                return false;
+            }
+
+            // entropy-bound sampler config: GGUF metadata first, then the reference defaults
+            // (same resolution as examples/diffusion/diffusion-cli.cpp)
+            auto meta_f = [&](const char * key, float def) -> float {
+                char buf[32];
+                return llama_model_meta_val_str(model_tgt, key, buf, sizeof(buf)) >= 0 ? strtof(buf, nullptr) : def;
+            };
+            auto meta_i = [&](const char * key, int32_t def) -> int32_t {
+                char buf[32];
+                return llama_model_meta_val_str(model_tgt, key, buf, sizeof(buf)) >= 0 ? (int32_t) strtol(buf, nullptr, 10) : def;
+            };
+
+            diffusion_eb.max_denoising_steps  = meta_i("diffusion.eb_max_steps", 48);
+            diffusion_eb.t_min                = meta_f("diffusion.eb_t_min", 0.4f);
+            diffusion_eb.t_max                = meta_f("diffusion.eb_t_max", 0.8f);
+            diffusion_eb.entropy_bound        = meta_f("diffusion.eb_entropy_bound", 0.1f);
+            diffusion_eb.stability_threshold  = meta_i("diffusion.eb_stability_threshold", 1);
+            diffusion_eb.confidence_threshold = meta_f("diffusion.eb_confidence_threshold", 0.005f);
+
+            // correctness first: re-decode the whole [prompt | canvas] every step (UNIFIED phase) with
+            // host-side self-conditioning - no prefix-KV store, no device-resident SC
+            diffusion_eb.kv_cache     = false;
+            diffusion_eb.gpu_sampling = false;
+
+            SRV_INF("diffusion_eb: max_steps=%d t=[%.3f,%.3f] entropy_bound=%.4f stability=%d confidence=%.4f\n",
+                    diffusion_eb.max_denoising_steps, diffusion_eb.t_min, diffusion_eb.t_max,
+                    diffusion_eb.entropy_bound, diffusion_eb.stability_threshold, diffusion_eb.confidence_threshold);
+        }
 
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
@@ -1514,6 +1643,9 @@ private:
             bool backend_sampling = true;
 
             backend_sampling &= task.params.sampling.backend_sampling;
+
+            // the diffusion denoise loop samples on the host from the raw canvas logits
+            backend_sampling &= !diffusion_mode;
 
             // TODO: speculative decoding requires multiple samples per batch - not supported yet
             backend_sampling &= !(slot.can_speculate());
@@ -2383,7 +2515,285 @@ private:
         }
     }
 
+    // trim a denoised canvas: cut at the first end-of-generation token, or (checkpoints often emit no
+    // stop token) at the onset of a repetition loop (a token recurring at stride 1-2 for >= 6 steps)
+    // ported from examples/diffusion/diffusion-cli.cpp
+    size_t diffusion_trim_canvas(const llama_token * canvas, size_t n) const {
+        size_t cut = n;
+        for (size_t i = 0; i < n; i++) {
+            if (llama_vocab_is_eog(vocab, canvas[i])) {
+                cut = i;
+                break;
+            }
+        }
+        for (size_t i = 0; i + 1 < cut; i++) {
+            bool loop = false;
+            for (size_t stride = 1; stride <= 2 && !loop; stride++) {
+                size_t reps = 0;
+                for (size_t j = i; j + stride < n && canvas[j] == canvas[j + stride]; j += stride) {
+                    reps++;
+                }
+                loop = reps >= 6;
+            }
+            if (loop) {
+                cut = i;
+                break;
+            }
+        }
+        return cut;
+    }
+
+    // stream one denoised block as a single partial response (the diffusion path emits whole blocks of
+    // text, not single tokens)
+    void send_partial_response_diffusion(server_slot & slot, const std::string & text, const llama_tokens & tokens) {
+        auto res = std::make_unique<server_task_result_cmpl_partial>();
+
+        res->id    = slot.task->id;
+        res->index = slot.task->index;
+
+        res->content = text;
+        res->tokens  = tokens;
+
+        res->n_decoded             = slot.n_decoded;
+        res->n_prompt_tokens       = slot.task->n_tokens();
+        res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
+        res->post_sampling_probs   = slot.task->params.post_sampling_probs;
+
+        res->verbose           = slot.task->params.verbose;
+        res->res_type          = slot.task->params.res_type;
+        res->oaicompat_model   = slot.task->params.oaicompat_model;
+        res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+
+        // populate timings if this is final response or timings_per_token is enabled
+        if (slot.stop != STOP_TYPE_NONE || slot.task->params.timings_per_token) {
+            res->timings = slot.get_timings();
+        }
+
+        queue_results.send(std::move(res));
+    }
+
+    // block-diffusion canvas models (e.g. DiffusionGemma): generation runs the entropy-bound denoiser one
+    // canvas block at a time, block-autoregressively, mirroring examples/diffusion/diffusion-cli.cpp
+    // run_turn(). The autoregressive machinery in update_slots() assumes a KV cache, which is absent for
+    // diffusion archs (create_memory() returns nullptr), so canvas models divert here entirely. One block
+    // is denoised per call so that queued tasks (e.g. cancellations) are handled between blocks.
+    void update_slots_diffusion() {
+        GGML_ASSERT(slots.size() == 1);
+
+        server_slot & slot = slots[0];
+
+        if (!slot.is_processing()) {
+            SRV_INF("%s", "all slots are idle\n");
+            return;
+        }
+
+        // keep the queue polling while the slot is busy (same as update_slots)
+        {
+            SRV_DBG("%s", "posting NEXT_RESPONSE\n");
+
+            server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
+            task.id = queue_tasks.get_new_id();
+            queue_tasks.post(std::move(task));
+        }
+
+        const int32_t n_ubatch_max = std::min((int32_t) llama_n_ctx(ctx_tgt), (int32_t) llama_n_ubatch(ctx_tgt));
+
+        if (slot.state == SLOT_STATE_STARTED) {
+            slot.t_start_process_prompt = ggml_time_us();
+            slot.t_start_generation    = 0;
+
+            if (slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+                send_error(slot, "this functionality is not supported by block-diffusion models", ERROR_TYPE_NOT_SUPPORTED);
+                slot.release();
+                return;
+            }
+
+            if (slot.task->tokens.has_mtmd) {
+                send_error(slot, "multimodal is not supported by block-diffusion models", ERROR_TYPE_NOT_SUPPORTED);
+                slot.release();
+                return;
+            }
+
+            // empty prompt passed -> release the slot and send empty response
+            if (slot.task->tokens.empty()) {
+                SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
+
+                send_final_response(slot);
+                slot.release();
+                return;
+            }
+
+            const int32_t n_input = slot.task->n_tokens();
+            if (n_input + diffusion_canvas > n_ubatch_max) {
+                send_error(slot,
+                           string_format(
+                               "the whole [prompt | canvas] must fit in one ubatch: n_prompt + canvas_length "
+                               "= %d + %d = %d > %d, increase the context size",
+                               n_input, diffusion_canvas, n_input + diffusion_canvas, n_ubatch_max),
+                           ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                slot.release();
+                return;
+            }
+
+            slot.n_prompt_tokens_cache     = 0;
+            slot.n_prompt_tokens_processed = n_input;
+            slot.n_decoded                 = 0;
+
+            // the prefix grows by one committed canvas per block
+            slot.prompt.tokens.clear();
+            slot.prompt.tokens.insert(slot.task->tokens.get_text_tokens());
+
+            // there is no separate prompt pass - the prompt is (re-)decoded inside every denoise step
+            slot.state = SLOT_STATE_GENERATING;
+            slot.t_start_generation  = ggml_time_us();
+            slot.t_prompt_processing = std::max<int64_t>(1, slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+            metrics.on_prompt_eval(slot);
+
+            if (slot.task->params.stream) {
+                // signal HTTP to send the headers (i.e. 200 status)
+                send_partial_response(slot, {}, false, true);
+            }
+        }
+
+        // effective new-token budget (mirrors server_slot::has_budget)
+        int32_t n_predict = -1;
+        if (slot.task->params.n_predict >= 0) {
+            n_predict = slot.task->params.n_predict;
+        } else if (params_base.n_predict >= 0) {
+            n_predict = params_base.n_predict;
+        }
+
+        // denoise one block
+        llama_tokens tokens_block;
+        bool block_full = false; // the canvas denoised completely (no EOG / repetition cut)
+
+        const llama_tokens prefix     = slot.prompt.tokens.get_text_tokens();
+        const int32_t      prefix_len = (int32_t) prefix.size();
+        const int32_t      max_length = prefix_len + diffusion_canvas;
+
+        if (max_length <= n_ubatch_max) {
+            diffusion_eb_params eb = diffusion_eb;
+
+            eb.max_length = max_length;
+            eb.seed       = slot.task->params.sampling.seed != LLAMA_DEFAULT_SEED
+                                ? (int32_t) slot.task->params.sampling.seed
+                                : (int32_t) (ggml_time_us() & 0x7FFFFFFF);
+
+            std::vector<llama_token> output_tokens(max_length);
+
+            int32_t n_generated = 0;
+            diffusion_generate_entropy_bound(ctx_tgt, prefix.data(), output_tokens.data(), prefix_len, eb, n_generated);
+
+            if (n_generated <= prefix_len) {
+                send_error(slot, "diffusion generation failed", ERROR_TYPE_SERVER);
+                slot.release();
+                return;
+            }
+
+            const llama_token * canvas = output_tokens.data() + prefix_len;
+            const size_t        cut    = diffusion_trim_canvas(canvas, (size_t) diffusion_canvas);
+
+            block_full = cut == (size_t) diffusion_canvas;
+            tokens_block.assign(canvas, canvas + cut);
+
+            if (!block_full) {
+                // end token or repetition loop: the answer is complete
+                slot.stop = STOP_TYPE_EOS;
+            }
+        } else {
+            // out of ubatch room for another block (cannot be the first block - checked at start):
+            // stop and keep what we have
+            slot.stop      = STOP_TYPE_LIMIT;
+            slot.truncated = true;
+        }
+
+        // enforce the n_predict budget
+        if (n_predict >= 0 && slot.n_decoded + (int32_t) tokens_block.size() >= n_predict) {
+            tokens_block.resize(n_predict - slot.n_decoded);
+            slot.stop = STOP_TYPE_LIMIT;
+        }
+
+        // enforce the generation time limit
+        if (slot.stop == STOP_TYPE_NONE && slot.task->params.t_max_predict_ms > 0 &&
+            (ggml_time_us() - slot.t_start_generation > 1000 * slot.task->params.t_max_predict_ms)) {
+            slot.stop = STOP_TYPE_LIMIT;
+        }
+
+        slot.n_decoded  += (int32_t) tokens_block.size();
+        slot.n_remaining = n_predict >= 0 ? n_predict - slot.n_decoded : -1;
+
+        const std::string text_block = common_detokenize(ctx_tgt, tokens_block, false);
+
+        slot.generated_text += text_block;
+        if (slot.task->params.return_tokens) {
+            slot.generated_tokens.insert(slot.generated_tokens.end(), tokens_block.begin(), tokens_block.end());
+        }
+        if (text_block.find('\n') != std::string::npos) {
+            slot.has_new_line = true;
+        }
+
+        bool finished = slot.stop != STOP_TYPE_NONE;
+
+        // apply the request "stop" strings to the accumulated text (mirrors process_token)
+        size_t pos = std::min(slot.n_sent_text, slot.generated_text.size());
+
+        const std::string str_test = slot.generated_text.substr(pos);
+
+        size_t stop_pos = slot.find_stopping_strings(str_test, text_block.size(), true);
+        if (stop_pos != std::string::npos) {
+            // full stop-string hit: truncate the text and finish (sets STOP_TYPE_WORD)
+            slot.generated_text.erase(
+                slot.generated_text.begin() + pos + stop_pos,
+                slot.generated_text.end());
+            pos      = std::min(slot.n_sent_text, slot.generated_text.size());
+            finished = true;
+        } else if (!finished) {
+            // a partial stop-string match at the block end is held back until the next block resolves it
+            stop_pos = slot.find_stopping_strings(str_test, text_block.size(), false);
+        }
+
+        std::string text_to_send;
+        if (finished) {
+            text_to_send = slot.generated_text.substr(pos);
+            slot.n_sent_text += text_to_send.size();
+        } else if (stop_pos == std::string::npos) {
+            // emit up to the last complete UTF-8 character
+            const size_t valid_to = validate_utf8(slot.generated_text);
+            if (valid_to > pos) {
+                text_to_send = slot.generated_text.substr(pos, valid_to - pos);
+                slot.n_sent_text += text_to_send.size();
+            }
+        }
+
+        slot.t_token_generation = std::max<int64_t>(1, ggml_time_us() - slot.t_start_generation) / 1e3;
+
+        // emit the trimmed block as ONE partial response
+        if (slot.task->params.stream && !text_to_send.empty()) {
+            send_partial_response_diffusion(slot, text_to_send, tokens_block);
+        }
+
+        if (!finished && block_full) {
+            // commit the whole canvas to the prefix and denoise the next block on the next call
+            slot.prompt.tokens.insert(tokens_block);
+
+            SLT_DBG(slot, "block committed, n_decoded = %d, prefix = %d\n", slot.n_decoded, slot.prompt.n_tokens());
+            return;
+        }
+
+        slot.print_timings();
+        send_final_response(slot);
+        metrics.on_prediction(slot);
+        slot.release();
+    }
+
     void update_slots() {
+        // block-diffusion canvas models bypass the autoregressive machinery below entirely:
+        // there is no KV cache, no batching across slots, and no token-by-token sampling
+        if (diffusion_mode) {
+            update_slots_diffusion();
+            return;
+        }
+
         // check if all slots are idle
         {
             bool all_idle = true;

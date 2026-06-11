@@ -1277,6 +1277,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    // diffusion canvas models (e.g. DiffusionGemma) self-condition via a full-vocab soft-embedding in the
+    // graph; enable it before the context is created so the reserve pass sizes the compute buffers for the
+    // self-conditioning subgraph. The real logits buffer is supplied per denoise step.
+    // see examples/diffusion/diffusion-cli.cpp
+    if (llama_model_is_diffusion(model)) {
+        char canvas_str[32];
+        if (llama_model_meta_val_str(model, "diffusion.canvas_length", canvas_str, sizeof(canvas_str)) >= 0 &&
+            strtol(canvas_str, nullptr, 10) > 0) {
+            llama_diffusion_set_sc(model, nullptr, /*use_sc*/ 0.0f, /*temp_inv*/ 1.0f, /*enabled*/ true);
+        }
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());

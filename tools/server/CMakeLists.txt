@@ -17,6 +17,10 @@ add_library(${TARGET} STATIC
     server-context.h
     server-tools.cpp
     server-tools.h
+    # block-diffusion samplers (canvas models such as DiffusionGemma); only depends on llama.h + common.
+    # compiled in directly because the llama-diffusion library target only exists when examples are built
+    ../../examples/diffusion/diffusion.cpp
+    ../../examples/diffusion/diffusion.h
 )
 
 if (BUILD_SHARED_LIBS)
@@ -24,6 +28,7 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
+target_include_directories(${TARGET} PRIVATE ../../examples/diffusion)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
