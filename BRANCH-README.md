@@ -1,3 +1,12 @@
+# Branch: `dg-preview` (= `server-block-diffusion` + Ollama compat)
+
+> This branch is `server-block-diffusion` (documented below, unchanged) plus
+> two commits that bake Ollama's llama.cpp compatibility layer into the tree,
+> so the companion `audreyt/ollama` `dg-preview` branch can build a working
+> `ollama run` stack against it. See the **dg-preview addendum** at the end
+> of this file. If you only care about `llama-server`, use
+> `server-block-diffusion` instead.
+
 # Branch: `server-block-diffusion`
 
 An out-of-tree `tools/server` integration for block-diffusion (canvas) models
@@ -117,3 +126,41 @@ Release build, at this branch's exact commits:
 MIT, same as upstream llama.cpp. This README and the verification harness
 were prepared with AI assistance; the server-mode code and all upstream
 communication are authored and reviewed by Audrey Tang.
+
+---
+
+# dg-preview addendum
+
+`dg-preview` adds two commits on top of `server-block-diffusion`:
+
+| Commit | Author | Role |
+|---|---|---|
+| `compat: bake ollama hooks + laguna registration into this tree` | Audrey Tang (replaying dhiltgen's patches) | applies Ollama's two `llama/compat` patches (`llama-cpp-hooks.patch`, `models/llama-cpp-laguna.patch`) so the patched state is committed; +59 lines of pure call-site/registration insertions |
+| `cmake: optional OLLAMA_COMPAT_DIR to link ollama compat layer in-tree` | Audrey Tang | configure-time knob to compile `ollama/llama/compat/*.cpp` into `llama`/`mtmd` for in-tree builds |
+
+**Credit:** the compatibility mechanism — the hook patches, the
+`llama-ollama-compat` translation layer they call into, and the laguna
+model shim — is **dhiltgen's work in ollama/ollama (`llama/compat/`, MIT
+licence)**. These commits replay and reference it; they do not modify it.
+The compat *source files* are not copied into this tree: they stay in the
+ollama repository and are linked in at build time.
+
+**Why it exists:** Ollama fetches llama.cpp by pinned tag and applies the
+compat patches at fetch time, but its developer source-override path
+(`OLLAMA_LLAMA_CPP_SOURCE` / `FETCHCONTENT_SOURCE_DIR_LLAMA_CPP`)
+intentionally skips patching. Committing the patched state makes the
+`audreyt/ollama:dg-preview` build reproducible from a plain FetchContent
+pin (its `LLAMA_CPP_VERSION` points at this branch's tip) and harmless
+either way — Ollama's `apply-patch.cmake` detects the already-applied state
+via `git apply --reverse --check` and skips gracefully.
+
+**Build (paired with audreyt/ollama `dg-preview`):** see
+`docs/dg-preview-build.md` in that repository. For in-tree builds of this
+branch alone, add `-DOLLAMA_COMPAT_DIR=<ollama-checkout>/llama/compat`
+(requires an ollama checkout at its `dg-preview` branch for the
+b9590-compatible `laguna.cpp`).
+
+**Sunset:** this branch is an unofficial source-only preview. It will be
+retired the moment upstream ships — i.e. when diffusion serving merges into
+ggml-org/llama.cpp or Ollama ships official DiffusionGemma support,
+whichever comes first.
