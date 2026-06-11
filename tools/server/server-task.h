@@ -76,6 +76,10 @@ struct task_params {
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
 
+    // block-diffusion models, raw completion path: return the raw denoised stream
+    // (channel/thought scaffold included) instead of the extracted final answer
+    bool diffusion_raw = false;
+
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 

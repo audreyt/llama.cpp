@@ -150,6 +150,13 @@ struct server_slot {
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
 
+    // block-diffusion: the model answers in a "<|channel>thought ... <channel|>" scaffold; on the raw
+    // completion path the visible stream is everything after the LAST channel-close (mirrors the
+    // extraction in examples/diffusion-gemma/diffusion-gemma-cli.cpp). unused by autoregressive models
+    bool        diffusion_strip      = false; // strip the scaffold from the emitted stream
+    bool        diffusion_seen_close = false; // a channel-close has been generated
+    std::string diffusion_held;               // raw text held back while still inside the scaffold
+
     std::vector<completion_token_output> generated_token_probs;
 
     bool has_next_token = true;
@@ -255,6 +262,10 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+
+        diffusion_strip      = false;
+        diffusion_seen_close = false;
+        diffusion_held.clear();
 
         if (can_speculate()) {
             spec_draft.clear();
@@ -771,6 +782,12 @@ private:
     int32_t             diffusion_canvas = 0;  // GGUF diffusion.canvas_length
     diffusion_eb_params diffusion_eb;          // sampler config resolved from GGUF diffusion.eb_* keys
 
+    // channel-close marker "<channel|>" ending the model's thought scaffold, resolved from the vocab
+    // at init (same resolution as examples/diffusion-gemma/diffusion-gemma-cli.cpp): the single vocab
+    // token if the marker tokenizes to one, the piece string as fallback
+    llama_token diffusion_chan_close = LLAMA_TOKEN_NULL;
+    std::string diffusion_chan_close_piece = "<channel|>";
+
     bool sleeping = false;
 
     void destroy() {
@@ -1040,6 +1057,17 @@ private:
             SRV_INF("diffusion_eb: max_steps=%d t=[%.3f,%.3f] entropy_bound=%.4f stability=%d confidence=%.4f\n",
                     diffusion_eb.max_denoising_steps, diffusion_eb.t_min, diffusion_eb.t_max,
                     diffusion_eb.entropy_bound, diffusion_eb.stability_threshold, diffusion_eb.confidence_threshold);
+
+            // the model thinks in a "<|channel>thought ... <channel|>" scaffold before the answer;
+            // resolve the channel-close marker exactly like the diffusion CLI does
+            {
+                const auto toks = common_tokenize(vocab, diffusion_chan_close_piece, false, true);
+                if (toks.size() == 1) {
+                    diffusion_chan_close = toks[0];
+                }
+                SRV_INF("diffusion channel-close marker: '%s' -> token %d\n",
+                        diffusion_chan_close_piece.c_str(), diffusion_chan_close);
+            }
         }
 
         if (params_base.speculative.has_dft()) {
@@ -2646,6 +2674,18 @@ private:
             slot.n_prompt_tokens_processed = n_input;
             slot.n_decoded                 = 0;
 
+            // the raw completion path (/completion, /v1/completions - e.g. Ollama /api/generate) gets
+            // the thought scaffold stripped and only the final answer emitted; the jinja chat paths
+            // (/v1/chat/completions etc.) stay raw - their chat parser splits reasoning downstream.
+            // "diffusion_raw": true opts out, for debugging and byte-comparison against the CLI oracle
+            {
+                const task_response_type rt = slot.task->params.res_type;
+                slot.diffusion_strip = !slot.task->params.diffusion_raw &&
+                                       (rt == TASK_RESPONSE_TYPE_NONE || rt == TASK_RESPONSE_TYPE_OAI_CMPL);
+            }
+            slot.diffusion_seen_close = false;
+            slot.diffusion_held.clear();
+
             // the prefix grows by one committed canvas per block
             slot.prompt.tokens.clear();
             slot.prompt.tokens.insert(slot.task->tokens.get_text_tokens());
@@ -2729,7 +2769,60 @@ private:
         slot.n_decoded  += (int32_t) tokens_block.size();
         slot.n_remaining = n_predict >= 0 ? n_predict - slot.n_decoded : -1;
 
-        const std::string text_block = common_detokenize(ctx_tgt, tokens_block, false);
+        bool finished = slot.stop != STOP_TYPE_NONE;
+
+        std::string text_block = common_detokenize(ctx_tgt, tokens_block, false);
+
+        // raw completion path: the model answers in a "<|channel>thought ... <channel|>" scaffold
+        // followed by the response. The visible stream is everything after the LAST channel-close
+        // (the same extraction as the diffusion CLI); blocks that are entirely scaffold emit nothing.
+        // n_decoded above keeps counting every generated token, so the reported counts stay true.
+        if (slot.diffusion_strip) {
+            // locate the last channel-close in this block: the vocab token when the marker resolved
+            // to a single token, its piece string otherwise
+            std::string tail;
+            bool closed = false;
+            if (diffusion_chan_close != LLAMA_TOKEN_NULL) {
+                int i_last = -1;
+                for (int i = 0; i < (int) tokens_block.size(); ++i) {
+                    if (tokens_block[i] == diffusion_chan_close) {
+                        i_last = i;
+                    }
+                }
+                if (i_last >= 0) {
+                    closed = true;
+                    tail   = common_detokenize(ctx_tgt,
+                                 llama_tokens(tokens_block.begin() + i_last + 1, tokens_block.end()), false);
+                }
+            } else {
+                const size_t p = text_block.rfind(diffusion_chan_close_piece);
+                if (p != std::string::npos) {
+                    closed = true;
+                    tail   = text_block.substr(p + diffusion_chan_close_piece.size());
+                }
+            }
+
+            if (closed) {
+                // everything up to and including the last channel-close is scaffold: restart the
+                // visible stream at the answer (chunks already streamed out cannot be recalled)
+                slot.generated_text.clear();
+                slot.n_sent_text = 0;
+                slot.diffusion_held.clear();
+                slot.diffusion_seen_close = true;
+                text_block = std::move(tail);
+            } else if (!slot.diffusion_seen_close) {
+                // still inside the thought scaffold: hold the raw text back, emit nothing yet
+                slot.diffusion_held += text_block;
+                text_block.clear();
+                if (finished) {
+                    // generation ended without any channel-close: the model did not use the
+                    // scaffold, emit the whole canvas (the CLI extraction starts at 0 here too)
+                    text_block = std::move(slot.diffusion_held);
+                    slot.diffusion_held.clear();
+                }
+            }
+            // else: the answer already started - the whole block is answer text
+        }
 
         slot.generated_text += text_block;
         if (slot.task->params.return_tokens) {
@@ -2738,8 +2831,6 @@ private:
         if (text_block.find('\n') != std::string::npos) {
             slot.has_new_line = true;
         }
-
-        bool finished = slot.stop != STOP_TYPE_NONE;
 
         // apply the request "stop" strings to the accumulated text (mirrors process_token)
         size_t pos = std::min(slot.n_sent_text, slot.generated_text.size());
