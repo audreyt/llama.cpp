@@ -833,13 +833,20 @@ private:
             // context size, similar to how examples/diffusion/diffusion-cli.cpp sizes them from -n.
             // an automatic -c would be resolved only later (by the fit pass, possibly to the full training
             // context), so pin a predictable default here; note that the compute buffers scale with
-            // n_ubatch * n_vocab, so very large -c values are expensive
+            // n_ubatch * n_vocab and every denoise step decodes a full ubatch, so cap the automatic growth
+            // and require an explicit -ub for longer prompts (a large -c alone is likely a client-side
+            // context heuristic tuned for autoregressive decoding, not a request for a huge ubatch)
             if (params_base.n_ctx <= 0) {
                 params_base.n_ctx = 8192;
                 SRV_INF("block-diffusion: -c is auto, defaulting to n_ctx = %d\n", params_base.n_ctx);
             }
-            params_base.n_ubatch = std::max(params_base.n_ubatch, params_base.n_ctx);
+            params_base.n_ubatch = std::max(params_base.n_ubatch, std::min(params_base.n_ctx, 8192));
             params_base.n_batch  = std::max(params_base.n_batch,  params_base.n_ubatch);
+            if (params_base.n_ubatch < params_base.n_ctx) {
+                SRV_WRN("block-diffusion: n_ubatch = %d caps the usable context (n_ctx = %d); "
+                        "prompts longer than n_ubatch - canvas_length will be rejected, raise -ub to extend\n",
+                        params_base.n_ubatch, params_base.n_ctx);
+            }
 
             // no llama KV cache exists for diffusion archs (create_memory returns nullptr) - disable
             // everything that assumes one
