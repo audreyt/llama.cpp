@@ -222,6 +222,33 @@ if (LLAMA_BUILD_APP)
     add_subdirectory(app)
 endif()
 
+# Optional: link the Ollama compat translation layer into libllama/mtmd.
+# This tree carries ollama's llama/compat hook patches pre-applied (see
+# src/llama-model-loader.cpp, tools/mtmd/clip.cpp), so libllama references
+# llama_ollama_compat::* symbols whose sources live in the ollama repo.
+# In-tree builds must point OLLAMA_COMPAT_DIR at <ollama>/llama/compat;
+# the ollama llama/server build links these sources itself.
+set(OLLAMA_COMPAT_DIR "" CACHE PATH "Path to ollama's llama/compat directory (links the compat layer into in-tree builds)")
+if (OLLAMA_COMPAT_DIR)
+    file(GLOB _ollama_compat_sources CONFIGURE_DEPENDS ${OLLAMA_COMPAT_DIR}/*.cpp)
+    foreach (_ollama_compat_target IN ITEMS llama mtmd)
+        if (TARGET ${_ollama_compat_target})
+            target_sources(${_ollama_compat_target} PRIVATE ${_ollama_compat_sources})
+            target_include_directories(${_ollama_compat_target} PRIVATE
+                ${OLLAMA_COMPAT_DIR}
+                ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        endif()
+    endforeach()
+    if (TARGET mtmd)
+        target_compile_definitions(mtmd PRIVATE OLLAMA_COMPAT_MTMD_BUILD)
+    endif()
+    file(GLOB _ollama_compat_model_sources CONFIGURE_DEPENDS ${OLLAMA_COMPAT_DIR}/models/*.cpp)
+    if (_ollama_compat_model_sources AND TARGET llama)
+        target_sources(llama PRIVATE ${_ollama_compat_model_sources})
+        target_include_directories(llama PRIVATE ${OLLAMA_COMPAT_DIR}/models)
+    endif()
+endif()
+
 #
 # install
 #
