@@ -359,6 +359,12 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                     "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
                 };
                 break;
+            case LLAMA_VOCAB_PRE_TYPE_LAGUNA:
+                regex_exprs = {
+                    "(?:\\r?\\n)+(?!\\r?\\n)",
+                    "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+                };
+                break;
             case LLAMA_VOCAB_PRE_TYPE_GPT2:
             case LLAMA_VOCAB_PRE_TYPE_MPT:
             case LLAMA_VOCAB_PRE_TYPE_OLMO:
@@ -2099,6 +2105,8 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             } else if (tokenizer_pre == "minicpm5") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_MINICPM5;
                 ignore_merges = true;
+            } else if (tokenizer_pre == "laguna") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_LAGUNA;
             } else if (
                     tokenizer_pre == "llama3"   ||
                     tokenizer_pre == "llama-v3" ||
@@ -2772,6 +2780,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     || t.first == "<turn|>"          // gemma4
                     || t.first == "<|tool_response>" // gemma4
                     || t.first == "<｜end▁of▁sentence｜>" // deepseek-ocr
+                    || t.first == "</assistant>"     // poolside Laguna (eos_token_ids)
                ) {
                 special_eog_ids.insert(t.second);
                 if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
